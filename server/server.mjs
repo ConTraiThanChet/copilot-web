@@ -150,7 +150,7 @@ function onRelayMessage(raw) {
   let msg;
   try { msg = JSON.parse(raw); } catch { return; }
   if (msg.t === 'hello') {
-    relayInfo = { metadata: msg.metadata, userAgent: msg.userAgent };
+    relayInfo = { metadata: msg.metadata, checksBootstrap: msg.checksBootstrap ?? null, userAgent: msg.userAgent };
     log('relay connected', msg.href);
     for (const w of [...relayWaiters]) w(true);
   } else if (msg.t === 'result') {
@@ -220,7 +220,11 @@ async function serveFile(req, res, url) {
   const p = url.searchParams.get('path') || '';
   const protocol = url.searchParams.get('protocol');
   if (protocol && protocol !== 'asset') {
-    const r = await relayFetch(`${protocol}://localhost/${encodeURIComponent(p)}`);
+    const extra = new URLSearchParams(url.searchParams);
+    extra.delete('path');
+    extra.delete('protocol');
+    const qs = extra.toString();
+    const r = await relayFetch(`${protocol}://localhost/${encodeURIComponent(p)}${qs ? '?' + qs : ''}`);
     if (!r) { res.writeHead(502); return res.end(); }
     const body = Buffer.from(r.body || '', 'base64');
     res.writeHead(r.status || 200, { 'Content-Type': r.type || 'application/octet-stream', 'Content-Length': body.length, 'Cache-Control': 'no-cache' });
@@ -276,10 +280,12 @@ const server = http.createServer(async (req, res) => {
       case '/__native-info': {
         const ready = await waitForRelay(Math.min(Number(url.searchParams.get('wait') || 0), 30000));
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        return res.end(JSON.stringify({ ready, metadata: relayInfo?.metadata || null, home: os.homedir() }));
+        return res.end(JSON.stringify({ ready, metadata: relayInfo?.metadata || null, checksBootstrap: relayInfo?.checksBootstrap ?? null, home: os.homedir() }));
       }
       case '/__file':
         return await serveFile(req, res, url);
+      case '/copilot-web.js':
+        return sendFile(req, res, path.join(here, '..', 'web', 'copilot-web.js'));
       case '/__upload':
         if (req.method !== 'POST') { res.writeHead(405); return res.end(); }
         return await handleUpload(req, res, url);

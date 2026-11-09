@@ -135,7 +135,13 @@
       return setTimeout(connect, 1000)
     }
     ws.onopen = function () {
-      send({ t: 'hello', metadata: window.__TAURI_INTERNALS__.metadata, userAgent: navigator.userAgent, href: location.href })
+      send({
+        t: 'hello',
+        metadata: window.__TAURI_INTERNALS__.metadata,
+        checksBootstrap: window.__GITHUB_APP_CHECKS_STORAGE_BOOTSTRAP__ === undefined ? null : window.__GITHUB_APP_CHECKS_STORAGE_BOOTSTRAP__,
+        userAgent: navigator.userAgent,
+        href: location.href,
+      })
     }
     ws.onmessage = function (ev) {
       try { handle(JSON.parse(ev.data)) } catch (e) { console.error('[copilot-web relay]', e) }

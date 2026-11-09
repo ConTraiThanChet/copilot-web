@@ -148,7 +148,7 @@ desktop_app_pids() {
     [ "$p" = "$ours" ] && continue
     if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^COPILOT_WEB_HEADLESS_UI=1$'; then continue; fi
     echo "$p"
-  done
+  done || true
 }
 
 start_xvfb() {
@@ -183,11 +183,13 @@ web_url() {
 }
 
 load_codespace_env() {
-  # SSH sessions may lack the Codespaces variables; read them from the container env.
-  if [ -z "${CODESPACE_NAME:-}" ] && [ -r /proc/1/environ ]; then
-    local v
-    v="$(tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^CODESPACE_NAME=//p')" && [ -n "$v" ] && export CODESPACE_NAME="$v"
-    v="$(tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN=//p')" && [ -n "$v" ] && export GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN="$v"
+  # SSH sessions may lack the Codespaces variables; read them from the codespace env file.
+  local f=/workspaces/.codespaces/shared/.env v
+  if [ -z "${CODESPACE_NAME:-}" ] && [ -r "$f" ]; then
+    v="$(sed -n 's/^CODESPACE_NAME=//p' "$f" | head -n1)"
+    [ -n "$v" ] && export CODESPACE_NAME="$v"
+    v="$(sed -n 's/^GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN=//p' "$f" | head -n1)"
+    [ -n "$v" ] && export GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN="$v"
   fi
   return 0
 }

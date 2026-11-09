@@ -285,6 +285,7 @@
       return q;
     },
   };
+  if (info.checksBootstrap) window.__GITHUB_APP_CHECKS_STORAGE_BOOTSTRAP__ = info.checksBootstrap;
   Object.defineProperty(window, '__TAURI_INTERNALS__', { value: internals, configurable: false, writable: false });
   Object.defineProperty(window, '__TAURI_EVENT_PLUGIN_INTERNALS__', { value: { unregisterListener: function () {} } });
   globalThis.isTauri = true;
