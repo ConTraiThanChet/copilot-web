@@ -4,12 +4,71 @@ Run the **GitHub Copilot desktop app** in a regular browser. On a Codespace (or
 any Linux host), Copilot Web starts only the Copilot backend and a small web
 server. The backend runs headless: it gets no visible window, and the full
 React UI is not loaded on the host. You then use the complete app UI (sessions,
-subagents, images, canvases, terminal, settings) from any browser, including
-through the Codespaces port forwarding URL.
+subagents, images, browser preview, canvases, terminal, settings) from any
+browser, including through the Codespaces port forwarding URL.
 
-> This repository contains only tooling. The app itself (its binary and web
-> frontend) is extracted at install time from your own copy of the official
-> GitHub Copilot AppImage, and is never committed here.
+> This repository contains only tooling. The app itself is downloaded from the
+> official release (`github/app`) at install time, and its web frontend is
+> extracted locally. Neither is committed here.
+
+## Quick start
+
+Run this in any Codespace (or Linux machine) terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ConTraiThanChet/copilot-web/main/setup.sh | bash
+```
+
+The script will:
+
+1. download the latest GitHub Copilot desktop app (Linux AppImage, x64 or arm64);
+2. extract and patch the web UI, install the dependencies it needs (Xvfb,
+   xdotool, gnome-keyring, …), and build the relay;
+3. enable **autostart**, so Copilot Web starts whenever the codespace opens;
+4. start Copilot Web and print its URL, for example
+   `https://<codespace>-8787.app.github.dev/`.
+
+Running the same command again updates Copilot Web and the app.
+
+Options: `... | COPILOT_WEB_PASSWORD=secret COPILOT_WEB_PORT=8787 bash`, or pass
+`bash -s -- --no-start` / `--no-autostart`.
+
+### Codespace for this repository
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/ConTraiThanChet/copilot-web)
+
+Opening a codespace on this repository sets everything up automatically. Port
+8787 opens in the browser when it is ready.
+
+### From a private copy (e.g. GitHub Enterprise)
+
+```bash
+gh repo clone <owner>/copilot-web ~/copilot-web && ~/copilot-web/setup.sh
+```
+
+`setup.sh` uses the checkout it runs from. Set `COPILOT_WEB_REPO` to make
+`curl … | bash` installs clone from your copy.
+
+### Signing in
+
+The first time you open the web UI, sign in the same way as in the desktop app:
+
+* **Continue as @user**: if the host already has GitHub credentials (for
+  example a `gh auth login` session on the codespace), the app offers to reuse
+  them.
+* **Use a different account / GitHub Enterprise (\*.ghe.com)**: the device
+  sign-in page opens in a new browser tab. Approve it there, then return to the
+  web UI.
+
+Credentials are stored on the host, in its keyring and `~/.copilot`, and are
+shared with the desktop app if it runs on the same host.
+
+### Security
+
+Keep the Codespaces port **Private** (the default); GitHub then requires your
+sign-in to reach it. Anyone who can open the URL controls Copilot on that host.
+On other hosts, set `COPILOT_WEB_PASSWORD` or put Copilot Web behind your own
+authentication.
 
 ## How it works
 
@@ -44,45 +103,24 @@ through the Codespaces port forwarding URL.
 * **Display/keyring:** the backend runs on its own Xvfb display, with a private
   D-Bus session and gnome-keyring for stored credentials.
 
-## Install on a Codespace
-
-```bash
-git clone https://daengboost.ghe.com/WWM/copilot-web ~/copilot-web
-~/copilot-web/bin/copilot-web install --appimage ~/apps/GitHub-Copilot.AppImage   # path or URL
-~/copilot-web/bin/copilot-web start
-```
-
-Without `--appimage`, `install` looks in `~/apps`, `~/Applications`,
-`~/.local/bin`, and `~/Downloads`. To copy an AppImage from your machine:
-
-```bash
-gh codespace cp -c <codespace> ./GitHub-Copilot-linux-x64.AppImage 'remote:~/apps/GitHub-Copilot.AppImage'
-```
-
-Open the printed URL, for example
-`https://<codespace>-8787.app.github.dev/`. Keep the port **Private**:
-Codespaces then requires your GitHub sign-in. For extra protection, add
-`--password <secret>`.
-
-If the desktop app is already running on that host, stop it, or run
-`copilot-web start --replace`. Both use the same `~/.copilot` data, so your
-sessions, projects, and settings carry over.
-
 ## Commands
 
 | Command | Description |
 |---|---|
-| `copilot-web install [--appimage PATH\|URL]` | Extract the AppImage, build the web app and relay |
-| `copilot-web start [--port N] [--password P] [--replace]` | Start backend and web server |
+| `copilot-web install [--appimage PATH\|URL] [--latest]` | Get the app (downloads the latest release if needed) and build the web app |
+| `copilot-web update` | Download the latest app release, rebuild, and restart |
+| `copilot-web start [--port N] [--password P] [--replace]` | Start the backend and the web server (`--replace` stops a running desktop app) |
 | `copilot-web stop` / `restart` | Stop / restart everything |
 | `copilot-web status` / `url` | Status and web URL |
 | `copilot-web logs [backend\|server] [-f]` | Logs |
-| `copilot-web autostart enable\|disable` | Start when a shell opens (survives Codespace restarts) |
+| `copilot-web autostart enable\|disable` | Start when the codespace opens or a shell starts |
 
-To update the app, run `install` again with the new AppImage, then `restart`.
+Data lives in `~/.copilot` (shared with the desktop app) and
+`~/.local/share/copilot-web`. Codespaces keep the home directory across
+stop/start, but a **rebuild** resets it.
 
-Requirements: Linux x86_64, Node.js 20+, Xvfb, xdotool, dbus-x11, gnome-keyring, gcc.
-On Debian or Ubuntu, `install` installs missing packages with apt.
+Requirements: Linux x86_64 or arm64, Node.js 20+. On Debian or Ubuntu,
+`install` adds Xvfb, xdotool, dbus-x11, gnome-keyring, and gcc with apt.
 
 ## Limitations
 

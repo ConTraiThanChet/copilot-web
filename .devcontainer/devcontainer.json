@@ -1,0 +1,16 @@
+{
+  "name": "Copilot Web",
+  "image": "mcr.microsoft.com/devcontainers/base:bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/sshd:1": {}
+  },
+  "hostRequirements": { "cpus": 2, "memory": "8gb" },
+  "forwardPorts": [8787],
+  "portsAttributes": {
+    "8787": { "label": "Copilot Web", "onAutoForward": "openBrowser" }
+  },
+  "postCreateCommand": "./setup.sh --no-start",
+  "postStartCommand": "bin/copilot-web start"
+}
