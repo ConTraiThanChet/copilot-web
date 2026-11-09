@@ -12,7 +12,8 @@
     if (!internals || !internals.invoke || !internals.metadata || !internals.transformCallback) return setTimeout(start, 100)
     if (window !== window.top) return
     var label = internals.metadata.currentWindow && internals.metadata.currentWindow.label
-    if (label !== 'main') return
+    var webviewLabel = internals.metadata.currentWebview && internals.metadata.currentWebview.label
+    if (label !== 'main' || (webviewLabel && webviewLabel !== 'main')) return
     if (!/^(tauri:|https?:\/\/tauri\.localhost)/.test(location.href)) return
     connect()
   }

@@ -35,6 +35,12 @@ through the Codespaces port forwarding URL.
   * it loads the empty `/blank.html` instead of the app UI.
 
   The webview only hosts the IPC relay, which keeps memory use low.
+* **Native views:** the agent browser preview and extension canvases are native
+  webviews on the host. The server captures them with the app's own
+  screenshot command, sending a frame only when the content changes. The
+  browser draws each frame at the bounds the app requested. Mouse, wheel,
+  keyboard, and pasted or IME text (Vietnamese Telex included) are replayed
+  into the view as real X input with `xdotool`.
 * **Display/keyring:** the backend runs on its own Xvfb display, with a private
   D-Bus session and gnome-keyring for stored credentials.
 
@@ -75,12 +81,14 @@ sessions, projects, and settings carry over.
 
 To update the app, run `install` again with the new AppImage, then `restart`.
 
-Requirements: Linux x86_64, Node.js 20+, Xvfb, dbus-x11, gnome-keyring, gcc.
+Requirements: Linux x86_64, Node.js 20+, Xvfb, xdotool, dbus-x11, gnome-keyring, gcc.
 On Debian or Ubuntu, `install` installs missing packages with apt.
 
 ## Limitations
 
-* Native child webviews (the agent browser preview and extension canvases) run
-  on the host's hidden display and are not shown in the browser yet.
+* Native views (browser preview and extension canvases) are streamed as images.
+  They update a few times per second when their content changes. Text inside
+  them cannot be selected from your browser, and the image follows the
+  browser's zoom level.
 * Folder pickers ask for a path on the host instead of opening a native dialog.
 * Global keyboard shortcuts, tray, and dock integrations are disabled.

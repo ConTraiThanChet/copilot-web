@@ -70,12 +70,21 @@
 
   function connectBridge() {
     bridge = new WebSocket(proto + '//' + location.host + '/__bridge');
+    bridge.binaryType = 'arraybuffer';
     bridge.onopen = function () {
       bridgeOpen = true;
       var q = queue; queue = [];
       q.forEach(function (m) { bridge.send(m); });
+      bridge.send(JSON.stringify({ t: 'viewport', width: window.innerWidth, height: window.innerHeight }));
+      if (typeof views !== 'undefined') views.forEach(function (v, label) {
+        if (v.watching) bridge.send(JSON.stringify({ t: 'view-watch', label: label, on: true }));
+      });
     };
     bridge.onmessage = function (ev) {
+      if (ev.data instanceof ArrayBuffer) {
+        try { onViewFrame(ev.data); } catch (e) { console.warn('[copilot-web] bad frame', e); }
+        return;
+      }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.t === 'result') {
@@ -249,8 +258,209 @@
     } catch (e) {
       return Promise.reject(e && e.message ? e.message : String(e));
     }
-    return remoteInvoke(cmd, args, options);
+    var p = remoteInvoke(cmd, args, options);
+    if (NATIVE_VIEW_COMMANDS[cmd]) {
+      p.then(function () { NATIVE_VIEW_COMMANDS[cmd](args); }, function () {});
+    }
+    return p;
   }
+
+  // ---------------------------------------------------------------------------
+  // Native views: the agent browser preview and extension canvases are native
+  // webviews on the host. Show them as live images at the bounds the app asks
+  // for, and forward mouse/keyboard input to them.
+  var views = new Map(); // label -> { el, img, bounds, visible, url }
+  var viewLayer = null;
+  function layer() {
+    if (viewLayer) return viewLayer;
+    viewLayer = document.createElement('div');
+    viewLayer.id = 'copilot-web-native-views';
+    viewLayer.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147482000;';
+    document.body.appendChild(viewLayer);
+    return viewLayer;
+  }
+  function bridgeSend(msg) {
+    var s = JSON.stringify(msg);
+    if (bridgeOpen) bridge.send(s); else queue.push(s);
+  }
+  function viewEnsure(label) {
+    var v = views.get(label);
+    if (v) return v;
+    var el = document.createElement('div');
+    el.dataset.nativeViewBox = label;
+    el.style.cssText = 'position:fixed;display:none;pointer-events:auto;outline:none;overflow:hidden;background:transparent;cursor:default;';
+    var img = document.createElement('img');
+    img.draggable = false;
+    img.alt = '';
+    img.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;user-select:none;-webkit-user-drag:none;';
+    el.appendChild(img);
+    // Hidden textarea receives keyboard focus so typed text and IME input
+    // (e.g. Vietnamese Telex) arrive as text events.
+    var ta = document.createElement('textarea');
+    ta.dataset.nativeView = label;
+    ta.setAttribute('autocomplete', 'off');
+    ta.setAttribute('autocorrect', 'off');
+    ta.setAttribute('autocapitalize', 'off');
+    ta.spellcheck = false;
+    ta.style.cssText = 'position:absolute;left:0;top:0;width:1px;height:1px;opacity:0;border:0;padding:0;resize:none;pointer-events:none;';
+    el.appendChild(ta);
+    v = { el: el, img: img, ta: ta, bounds: null, visible: true, watching: false, url: null };
+    views.set(label, v);
+    attachInput(label, v);
+    layer().appendChild(el);
+    return v;
+  }
+  function viewUpdate(label) {
+    var v = views.get(label);
+    if (!v) return;
+    var b = v.bounds;
+    var onScreen = !!b && b.width > 1 && b.height > 1 && b.x + b.width > 0 && b.y + b.height > 0 &&
+      b.x < window.innerWidth && b.y < window.innerHeight;
+    var show = v.visible && onScreen;
+    if (b) {
+      v.el.style.left = b.x + 'px';
+      v.el.style.top = b.y + 'px';
+      v.el.style.width = b.width + 'px';
+      v.el.style.height = b.height + 'px';
+    }
+    v.el.style.display = show ? 'block' : 'none';
+    if (show !== v.watching) {
+      v.watching = show;
+      bridgeSend({ t: 'view-watch', label: label, on: show });
+    }
+  }
+  function viewRemove(label) {
+    var v = views.get(label);
+    if (!v) return;
+    if (v.watching) bridgeSend({ t: 'view-watch', label: label, on: false });
+    if (v.url) URL.revokeObjectURL(v.url);
+    v.el.remove();
+    views.delete(label);
+  }
+  function setBounds(a) {
+    var v = viewEnsure(a.label);
+    v.bounds = { x: Number(a.x) || 0, y: Number(a.y) || 0, width: Number(a.width) || 0, height: Number(a.height) || 0 };
+    viewUpdate(a.label);
+  }
+  function setVisible(label, visible) {
+    if (!label) return;
+    viewEnsure(label).visible = visible;
+    viewUpdate(label);
+  }
+  var NATIVE_VIEW_COMMANDS = {
+    create_browser_preview: function (a) { viewEnsure(a.label); viewUpdate(a.label); },
+    create_extension_canvas_webview: function (a) { viewEnsure(a.label); viewUpdate(a.label); },
+    set_browser_preview_bounds: setBounds,
+    set_extension_canvas_webview_bounds: setBounds,
+    set_browser_preview_visibility: function (a) { setVisible(a.label, !!a.visible); },
+    suspend_extension_canvas_webview: function (a) { setVisible(a.label, false); },
+    resume_extension_canvas_webview: function (a) { setVisible(a.label, true); },
+    'plugin:webview|webview_hide': function (a) { if (views.has(a.label)) setVisible(a.label, false); },
+    'plugin:webview|webview_show': function (a) { if (views.has(a.label)) setVisible(a.label, true); },
+    'plugin:webview|webview_close': function (a) { viewRemove(a.label); },
+    close_browser_preview: function (a) { viewRemove(a.label); },
+    close_extension_canvas_webview: function (a) { viewRemove(a.label); },
+  };
+  window.addEventListener('resize', function () {
+    views.forEach(function (_, label) { viewUpdate(label); });
+    bridgeSend({ t: 'viewport', width: window.innerWidth, height: window.innerHeight });
+  });
+
+  function onViewFrame(buf) {
+    // [u32 headerLen][header JSON][u32 metaLen][meta JSON][PNG]
+    var dv = new DataView(buf);
+    var hlen = dv.getUint32(0, true);
+    var header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hlen)));
+    var v = views.get(header.label);
+    if (!v) return;
+    var off = 4 + hlen;
+    var mlen = dv.getUint32(off, true);
+    var png = new Blob([new Uint8Array(buf, off + 4 + mlen)], { type: 'image/png' });
+    var url = URL.createObjectURL(png);
+    var old = v.url;
+    v.url = url;
+    v.img.onload = function () { if (old) URL.revokeObjectURL(old); };
+    v.img.src = url;
+  }
+
+  function attachInput(label, v) {
+    var el = v.el;
+    var pendingMove = null, moveScheduled = false;
+    function pos(e) {
+      var r = el.getBoundingClientRect();
+      return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
+    }
+    function send(ev) {
+      var b = v.bounds || { x: 0, y: 0 };
+      bridgeSend({ t: 'view-input', label: label, origin: { x: b.x, y: b.y }, ev: ev });
+    }
+    var ta = v.ta;
+    function sendText(text) { if (text) send({ type: 'text', text: text }); }
+    ta.addEventListener('input', function (e) {
+      if (e.isComposing) return;
+      sendText(ta.value);
+      ta.value = '';
+    });
+    ta.addEventListener('compositionend', function () {
+      sendText(ta.value);
+      ta.value = '';
+    });
+    el.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      ta.focus({ preventScroll: true });
+      try { el.setPointerCapture(e.pointerId); } catch (x) { /* ignore */ }
+      var p = pos(e);
+      send({ type: 'down', button: e.button, x: p.x, y: p.y });
+    });
+    el.addEventListener('pointerup', function (e) {
+      e.preventDefault();
+      var p = pos(e);
+      send({ type: 'up', button: e.button, x: p.x, y: p.y });
+    });
+    el.addEventListener('pointermove', function (e) {
+      pendingMove = pos(e);
+      if (moveScheduled) return;
+      moveScheduled = true;
+      setTimeout(function () {
+        moveScheduled = false;
+        if (pendingMove) send({ type: 'move', x: pendingMove.x, y: pendingMove.y });
+        pendingMove = null;
+      }, 33);
+    });
+    el.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      var p = pos(e);
+      var scale = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1;
+      send({ type: 'wheel', x: p.x, y: p.y, dx: e.deltaX * scale, dy: e.deltaY * scale });
+    }, { passive: false });
+    el.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    ta.addEventListener('paste', function (e) {
+      e.preventDefault();
+      sendText(e.clipboardData && e.clipboardData.getData('text/plain'));
+    });
+  }
+  // Keyboard for a focused native view (capture phase, ahead of app shortcuts).
+  function activeView() {
+    var a = document.activeElement;
+    return a && a.dataset && a.dataset.nativeView ? a.dataset.nativeView : null;
+  }
+  window.addEventListener('keydown', function (e) {
+    var label = activeView();
+    if (!label) return;
+    var paste = (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'v' || e.key === 'V');
+    e.stopImmediatePropagation();
+    if (paste) return; // let the browser fire a paste event with the local clipboard
+    if (e.isComposing || e.key === 'Process' || e.keyCode === 229) return; // IME
+    var printable = !e.ctrlKey && !e.altKey && !e.metaKey && typeof e.key === 'string' && Array.from(e.key).length === 1;
+    if (printable) return; // delivered through the textarea's input event
+    e.preventDefault();
+    var v = views.get(label), b = v && v.bounds || { x: 0, y: 0 };
+    bridgeSend({ t: 'view-input', label: label, origin: { x: b.x, y: b.y }, ev: {
+      type: 'key', key: e.key, code: e.code, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey,
+    } });
+  }, true);
+  window.addEventListener('keyup', function (e) { if (activeView()) e.stopImmediatePropagation(); }, true);
+  window.addEventListener('keypress', function (e) { if (activeView()) e.stopImmediatePropagation(); }, true);
 
   // ---------------------------------------------------------------------------
   // Tauri internals surface

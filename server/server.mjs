@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
@@ -150,6 +151,8 @@ function onRelayMessage(raw) {
   let msg;
   try { msg = JSON.parse(raw); } catch { return; }
   if (msg.t === 'hello') {
+    nativeSize = { width: 0, height: 0 };
+    xWindow = null;
     relayInfo = { metadata: msg.metadata, checksBootstrap: msg.checksBootstrap ?? null, userAgent: msg.userAgent };
     log('relay connected', msg.href);
     for (const w of [...relayWaiters]) w(true);
@@ -300,6 +303,175 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Native views (agent browser preview, extension canvases): live frames + input
+
+const XDISPLAY = process.env.COPILOT_WEB_DISPLAY || '';
+const nativeViews = new Map(); // label -> { watchers:Set, timer, busy, lastHash, delay, wake }
+const FRAME_MIN_MS = 60;
+const FRAME_MAX_MS = 800;
+
+function viewState(label) {
+  let v = nativeViews.get(label);
+  if (!v) {
+    v = { watchers: new Set(), timer: null, busy: false, lastHash: null, delay: FRAME_MIN_MS };
+    nativeViews.set(label, v);
+  }
+  return v;
+}
+
+function scheduleCapture(label, delay) {
+  const v = nativeViews.get(label);
+  if (!v || v.watchers.size === 0) return;
+  clearTimeout(v.timer);
+  v.timer = setTimeout(() => captureView(label), delay);
+}
+
+async function captureView(label) {
+  const v = nativeViews.get(label);
+  if (!v || v.watchers.size === 0 || v.busy) return;
+  v.busy = true;
+  let changed = false;
+  try {
+    const value = await relayInvoke('capture_webview_screenshot', { label, binary: true });
+    const b64 = value && value.__cwb64;
+    if (b64) {
+      const payload = Buffer.from(b64, 'base64');
+      const hash = crypto.createHash('sha1').update(payload).digest('hex');
+      if (hash !== v.lastHash) {
+        v.lastHash = hash;
+        changed = true;
+        const header = Buffer.from(JSON.stringify({ label }));
+        const len = Buffer.alloc(4);
+        len.writeUInt32LE(header.length, 0);
+        const frame = Buffer.concat([len, header, payload]);
+        for (const id of v.watchers) {
+          const c = clients.get(id);
+          if (c && c.readyState === 1 && c.bufferedAmount < 8 * 1024 * 1024) c.send(frame, { binary: true });
+        }
+      }
+    }
+  } catch (e) {
+    v.delay = FRAME_MAX_MS * 2;
+  } finally {
+    v.busy = false;
+  }
+  v.delay = changed ? FRAME_MIN_MS : Math.min(FRAME_MAX_MS, Math.round(v.delay * 1.5));
+  scheduleCapture(label, v.delay);
+}
+
+function watchView(clientId, label, on) {
+  const v = viewState(label);
+  if (on) {
+    v.watchers.add(clientId);
+    v.lastHash = null; // send a fresh frame to the new watcher
+    scheduleCapture(label, 0);
+  } else {
+    v.watchers.delete(clientId);
+    if (v.watchers.size === 0) { clearTimeout(v.timer); nativeViews.delete(label); }
+  }
+}
+
+// xdotool commands are serialized; pending pointer moves are coalesced.
+const xQueue = [];
+let xRunning = false;
+let xWindow = null;
+function xdo(args, { coalesce = false } = {}) {
+  if (!XDISPLAY) return;
+  if (coalesce && xQueue.length && xQueue[xQueue.length - 1].coalesce) xQueue.pop();
+  xQueue.push({ args, coalesce });
+  if (!xRunning) xPump();
+}
+function xPump() {
+  const job = xQueue.shift();
+  if (!job) { xRunning = false; return; }
+  xRunning = true;
+  execFile('xdotool', job.args, { env: { ...process.env, DISPLAY: XDISPLAY }, timeout: 5000 }, () => xPump());
+}
+function xFindWindow() {
+  return new Promise((resolve) => {
+    if (!XDISPLAY) return resolve(null);
+    execFile('xdotool', ['search', '--name', '^GitHub Copilot$'], { env: { ...process.env, DISPLAY: XDISPLAY } }, (err, out) => {
+      resolve(err ? null : (out.trim().split(/\s+/)[0] || null));
+    });
+  });
+}
+
+const X_NAMED = {
+  Enter: 'Return', Backspace: 'BackSpace', Tab: 'Tab', Escape: 'Escape', Delete: 'Delete', Insert: 'Insert',
+  Home: 'Home', End: 'End', PageUp: 'Prior', PageDown: 'Next', ArrowLeft: 'Left', ArrowRight: 'Right',
+  ArrowUp: 'Up', ArrowDown: 'Down', ' ': 'space', ContextMenu: 'Menu', CapsLock: null,
+};
+const X_CODE = {
+  Minus: 'minus', Equal: 'equal', BracketLeft: 'bracketleft', BracketRight: 'bracketright', Backslash: 'backslash',
+  Semicolon: 'semicolon', Quote: 'apostrophe', Comma: 'comma', Period: 'period', Slash: 'slash', Backquote: 'grave', Space: 'space',
+};
+function xKeyFromEvent(ev) {
+  if (['Control', 'Shift', 'Alt', 'Meta', 'AltGraph', 'OS'].includes(ev.key)) return null;
+  if (Object.prototype.hasOwnProperty.call(X_NAMED, ev.key)) return X_NAMED[ev.key];
+  if (/^F\d{1,2}$/.test(ev.key)) return ev.key;
+  const code = String(ev.code || '');
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (/^Digit\d$/.test(code)) return code.slice(5);
+  if (X_CODE[code]) return X_CODE[code];
+  return null;
+}
+
+async function viewInput(msg) {
+  const ev = msg.ev || {};
+  const ox = Math.round(Number(msg.origin?.x) || 0), oy = Math.round(Number(msg.origin?.y) || 0);
+  const x = String(ox + Math.round(Number(ev.x) || 0)), y = String(oy + Math.round(Number(ev.y) || 0));
+  const btn = ({ 0: '1', 1: '2', 2: '3' })[ev.button] || '1';
+  switch (ev.type) {
+    case 'move':
+      xdo(['mousemove', x, y], { coalesce: true });
+      break;
+    case 'down':
+      if (!xWindow) xWindow = await xFindWindow();
+      if (xWindow) xdo(['windowfocus', xWindow]);
+      xdo(['mousemove', x, y, 'mousedown', btn]);
+      break;
+    case 'up':
+      xdo(['mousemove', x, y, 'mouseup', btn]);
+      break;
+    case 'wheel': {
+      const steps = (d) => Math.max(1, Math.min(10, Math.round(Math.abs(d) / 50)));
+      if (Math.abs(ev.dy) >= 1) xdo(['mousemove', x, y, 'click', '--repeat', String(steps(ev.dy)), '--delay', '0', ev.dy > 0 ? '5' : '4']);
+      if (Math.abs(ev.dx) >= 1) xdo(['mousemove', x, y, 'click', '--repeat', String(steps(ev.dx)), '--delay', '0', ev.dx > 0 ? '7' : '6']);
+      break;
+    }
+    case 'text':
+      if (typeof ev.text === 'string' && ev.text) xdo(['type', '--delay', '2', '--', ev.text.slice(0, 20000)]);
+      break;
+    case 'key': {
+      const mods = (ev.ctrl ? 'ctrl+' : '') + (ev.alt ? 'alt+' : '') + (ev.meta ? 'super+' : '');
+      if (!mods && typeof ev.key === 'string' && [...ev.key].length === 1 && ev.key !== ' ') {
+        xdo(['type', '--delay', '0', '--', ev.key]);
+        break;
+      }
+      const k = xKeyFromEvent(ev);
+      if (k) xdo(['key', '--clearmodifiers', mods + (ev.shift ? 'shift+' : '') + k]);
+      break;
+    }
+    default:
+      return;
+  }
+  const v = nativeViews.get(msg.label);
+  if (v) { v.delay = FRAME_MIN_MS; scheduleCapture(msg.label, 40); }
+}
+
+// Keep the hidden native window at least as large as the browser viewport so
+// native views are laid out (and reachable by input) at their requested bounds.
+let nativeSize = { width: 0, height: 0 };
+function ensureNativeSize(width, height) {
+  const w = Math.min(3800, Math.max(800, Math.round(width) || 0));
+  const h = Math.min(2100, Math.max(600, Math.round(height) || 0));
+  if (w <= nativeSize.width && h <= nativeSize.height) return;
+  nativeSize = { width: Math.max(w, nativeSize.width), height: Math.max(h, nativeSize.height) };
+  relayInvoke('plugin:window|set_size', { label: 'main', value: { Logical: nativeSize } }).catch(() => {});
+  relayInvoke('plugin:window|set_position', { label: 'main', value: { Logical: { x: 0, y: 0 } } }).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket endpoints
 const wssRelay = new WebSocketServer({ noServer: true, maxPayload: 512 * 1024 * 1024 });
 const wssBridge = new WebSocketServer({ noServer: true, maxPayload: 512 * 1024 * 1024, perMessageDeflate: true });
@@ -333,9 +505,16 @@ wssBridge.on('connection', (ws) => {
       }
     } else if (msg.t === 'release-callback') {
       relaySend({ t: 'release-callback', client: clientId, id: msg.id });
+    } else if (msg.t === 'view-watch' && typeof msg.label === 'string') {
+      watchView(clientId, msg.label, !!msg.on);
+    } else if (msg.t === 'view-input' && typeof msg.label === 'string') {
+      viewInput(msg).catch((e) => log('view input error', e.message));
+    } else if (msg.t === 'viewport') {
+      ensureNativeSize(msg.width, msg.height);
     }
   });
   ws.on('close', () => {
+    for (const label of [...nativeViews.keys()]) watchView(clientId, label, false);
     clients.delete(clientId);
     relaySend({ t: 'release-client', client: clientId });
     for (const [gid, p] of pendingInvokes) if (p.client === clientId) pendingInvokes.delete(gid);

@@ -75,6 +75,7 @@ ensure_system_deps() {
   need dbus-launch || missing+=(dbus-x11)
   need gnome-keyring-daemon || missing+=(gnome-keyring)
   need gcc || missing+=(gcc)
+  need xdotool || missing+=(xdotool)
   need curl || missing+=(curl)
   [ ${#missing[@]} -eq 0 ] || apt_install "${missing[@]}"
   need node || die "Node.js 20+ is required."
@@ -155,7 +156,7 @@ start_xvfb() {
   if pid_alive "$RUN_DIR/xvfb.pid"; then return; fi
   local n="${COPILOT_WEB_DISPLAY#:}"
   rm -f "/tmp/.X${n}-lock" "/tmp/.X11-unix/X${n}" 2>/dev/null || true
-  setsid Xvfb "$COPILOT_WEB_DISPLAY" -screen 0 1280x800x24 -nolisten tcp >"$LOG_DIR/xvfb.log" 2>&1 < /dev/null &
+  setsid Xvfb "$COPILOT_WEB_DISPLAY" -screen 0 3840x2160x24 -nolisten tcp >"$LOG_DIR/xvfb.log" 2>&1 < /dev/null &
   echo $! > "$RUN_DIR/xvfb.pid"
   for _ in $(seq 1 20); do [ -e "/tmp/.X11-unix/X${n}" ] && break; sleep 0.25; done
 }
@@ -238,7 +239,7 @@ cmd_start() {
   if ! pid_alive "$RUN_DIR/server.pid"; then
     log "Starting web server on port $COPILOT_WEB_PORT…"
     COPILOT_WEB_PORT="$COPILOT_WEB_PORT" COPILOT_WEB_PASSWORD="$COPILOT_WEB_PASSWORD" \
-    COPILOT_WEB_RELAY_TOKEN="$relay_token" COPILOT_WEB_STATE="$STATE_DIR" \
+    COPILOT_WEB_RELAY_TOKEN="$relay_token" COPILOT_WEB_STATE="$STATE_DIR" COPILOT_WEB_DISPLAY="$COPILOT_WEB_DISPLAY" \
       setsid node "$REPO_DIR/server/server.mjs" >>"$LOG_DIR/server.log" 2>&1 < /dev/null &
     echo $! > "$RUN_DIR/server.pid"
   fi
