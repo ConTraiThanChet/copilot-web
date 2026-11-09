@@ -101,6 +101,36 @@ appimage_url() {
   echo "${COPILOT_APPIMAGE_URL:-https://github.com/github/app/releases/latest/download/GitHub-Copilot-linux-${arch}.AppImage}"
 }
 
+ensure_runtime_libs() {
+  # Host libraries the AppImage expects but does not bundle.
+  local missing pkgs=() lib
+  missing="$(LD_LIBRARY_PATH="$APP_DIR/usr/lib" ldd "$APP_DIR/usr/bin/github" \
+    "$APP_DIR"/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/* "$APP_DIR"/usr/lib/aarch64-linux-gnu/webkit2gtk-4.1/* \
+    "$APP_DIR"/usr/lib/libwebkit2gtk*.so* 2>/dev/null | awk '/not found/ {print $1}' | sort -u)"
+  for lib in $missing; do
+    case "$lib" in
+      libasound.so.2) pkgs+=(libasound2) ;;
+      libEGL.so.1) pkgs+=(libegl1) ;;
+      libGL.so.1) pkgs+=(libgl1) ;;
+      libgbm.so.1) pkgs+=(libgbm1) ;;
+      libpulse.so.0) pkgs+=(libpulse0) ;;
+      libdrm.so.2) pkgs+=(libdrm2) ;;
+      libnss3.so|libnssutil3.so|libsmime3.so) pkgs+=(libnss3) ;;
+      libxkbcommon.so.0) pkgs+=(libxkbcommon0) ;;
+      libfontconfig.so.1) pkgs+=(libfontconfig1) ;;
+      *) log "Note: host library $lib is missing" ;;
+    esac
+  done
+  # Software OpenGL for the hidden webview, and fonts for rendered pages.
+  [ -e /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so ] || [ -e /usr/lib/aarch64-linux-gnu/dri/swrast_dri.so ] \
+    || ls /usr/lib/*/dri/*swrast* >/dev/null 2>&1 || pkgs+=(libgl1-mesa-dri)
+  fc-list 2>/dev/null | grep -q . || pkgs+=(fonts-dejavu-core fontconfig)
+  if [ ${#pkgs[@]} -gt 0 ]; then
+    mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+    apt_install "${pkgs[@]}"
+  fi
+}
+
 find_appimage() {
   local c
   for c in "$HOME"/apps/GitHub-Copilot*.AppImage "$HOME"/Applications/GitHub-Copilot*.AppImage \
@@ -148,6 +178,7 @@ cmd_install() {
   fi
   rm -rf "$APP_DIR.old"; [ -d "$APP_DIR" ] && mv "$APP_DIR" "$APP_DIR.old"
   mv "$tmp/squashfs-root" "$APP_DIR" && rm -rf "$tmp" "$APP_DIR.old"
+  ensure_runtime_libs
 
   log "Extracting the web frontend from the app binary…"
   node "$REPO_DIR/lib/extract-assets.mjs" "$APP_DIR/usr/bin/github" "$STATE_DIR/dist"
@@ -269,6 +300,7 @@ cmd_start() {
   fi
 
   if ! pid_alive "$RUN_DIR/backend.pid"; then
+    ensure_runtime_libs
     start_xvfb
     start_session_bus
     log "Starting Copilot backend (headless)…"
