@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# copilot-web — run the GitHub Copilot desktop app backend headlessly and use
+# the full app UI from any browser.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+STATE_DIR="${COPILOT_WEB_STATE:-$HOME/.local/share/copilot-web}"
+RUN_DIR="$STATE_DIR/run"
+LOG_DIR="$STATE_DIR/logs"
+CONFIG_FILE="$STATE_DIR/config.env"
+APP_DIR="$STATE_DIR/app"
+
+# Defaults; overridden by config.env, then by environment/flags.
+COPILOT_WEB_PORT_DEFAULT=8787
+COPILOT_WEB_DISPLAY_DEFAULT=:77
+
+log() { printf '\033[1;34m[copilot-web]\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31m[copilot-web]\033[0m %s\n' "$*" >&2; exit 1; }
+
+load_config() {
+  mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR"
+  # shellcheck disable=SC1090
+  [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+  COPILOT_WEB_PORT="${COPILOT_WEB_PORT:-$COPILOT_WEB_PORT_DEFAULT}"
+  COPILOT_WEB_DISPLAY="${COPILOT_WEB_DISPLAY:-$COPILOT_WEB_DISPLAY_DEFAULT}"
+  COPILOT_WEB_PASSWORD="${COPILOT_WEB_PASSWORD:-}"
+}
+
+save_config() {
+  umask 077
+  {
+    echo "COPILOT_WEB_PORT=${COPILOT_WEB_PORT@Q}"
+    echo "COPILOT_WEB_DISPLAY=${COPILOT_WEB_DISPLAY@Q}"
+    echo "COPILOT_WEB_PASSWORD=${COPILOT_WEB_PASSWORD@Q}"
+  } > "$CONFIG_FILE"
+}
+
+usage() {
+  cat <<EOF
+Usage: copilot-web <command> [options]
+
+Commands:
+  install [--appimage PATH|URL]   Extract the Copilot desktop AppImage and build the web app
+  start [--port N] [--password P] [--replace]
+                                  Start the backend (headless) and the web server
+  stop                            Stop the web server and the backend
+  restart                         Stop, then start
+  status                          Show process status and the web URL
+  logs [backend|server] [-f]      Show logs
+  url                             Print the web URL
+  autostart enable|disable        Start Copilot Web automatically when a shell opens
+
+Environment: COPILOT_WEB_PORT, COPILOT_WEB_PASSWORD, COPILOT_WEB_DISPLAY, COPILOT_WEB_STATE
+EOF
+}
+
+need() { command -v "$1" >/dev/null 2>&1; }
+
+pid_alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+apt_install() {
+  local pkgs=("$@")
+  if need apt-get; then
+    log "Installing system packages: ${pkgs[*]}"
+    local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+    $SUDO apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "${pkgs[@]}" >/dev/null
+  else
+    die "Missing: ${pkgs[*]}. Install them with your package manager."
+  fi
+}
+
+ensure_system_deps() {
+  local missing=()
+  need Xvfb || missing+=(xvfb)
+  need dbus-launch || missing+=(dbus-x11)
+  need gnome-keyring-daemon || missing+=(gnome-keyring)
+  need gcc || missing+=(gcc)
+  need curl || missing+=(curl)
+  [ ${#missing[@]} -eq 0 ] || apt_install "${missing[@]}"
+  need node || die "Node.js 20+ is required."
+  local major; major="$(node -p 'process.versions.node.split(".")[0]')"
+  [ "$major" -ge 20 ] || die "Node.js 20+ is required (found $(node -v))."
+}
+
+find_appimage() {
+  local c
+  for c in "$HOME"/apps/GitHub-Copilot*.AppImage "$HOME"/Applications/GitHub-Copilot*.AppImage \
+           "$HOME"/.local/bin/GitHub-Copilot*.AppImage "$HOME"/Downloads/GitHub-Copilot*.AppImage \
+           "$STATE_DIR"/GitHub-Copilot.AppImage; do
+    [ -f "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+cmd_install() {
+  load_config
+  local src="${COPILOT_APPIMAGE:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --appimage) src="$2"; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  ensure_system_deps
+
+  local appimage="$STATE_DIR/GitHub-Copilot.AppImage"
+  if [ -z "$src" ]; then
+    src="$(find_appimage)" || die "No GitHub Copilot AppImage found. Pass --appimage PATH|URL (copy it here with: gh codespace cp ./GitHub-Copilot.AppImage remote:~/apps/)."
+  fi
+  if [[ "$src" =~ ^https?:// ]]; then
+    log "Downloading AppImage…"
+    curl -fL --progress-bar -o "$appimage.part" "$src" && mv "$appimage.part" "$appimage"
+  elif [ "$(readlink -f "$src")" != "$(readlink -f "$appimage")" ]; then
+    log "Using AppImage $src"
+    cp -f "$src" "$appimage.part" && mv "$appimage.part" "$appimage"
+  fi
+  chmod +x "$appimage"
+
+  log "Extracting AppImage…"
+  local tmp="$STATE_DIR/extract.tmp"
+  rm -rf "$tmp" && mkdir -p "$tmp"
+  (cd "$tmp" && "$appimage" --appimage-extract >/dev/null)
+  [ -x "$tmp/squashfs-root/usr/bin/github" ] || die "Unexpected AppImage layout (usr/bin/github missing)."
+  if pid_alive "$RUN_DIR/backend.pid"; then
+    log "Backend is running; the new version is used after 'copilot-web restart'."
+  fi
+  rm -rf "$APP_DIR.old"; [ -d "$APP_DIR" ] && mv "$APP_DIR" "$APP_DIR.old"
+  mv "$tmp/squashfs-root" "$APP_DIR" && rm -rf "$tmp" "$APP_DIR.old"
+
+  log "Extracting the web frontend from the app binary…"
+  node "$REPO_DIR/lib/extract-assets.mjs" "$APP_DIR/usr/bin/github" "$STATE_DIR/dist"
+  node "$REPO_DIR/lib/patch-web.mjs" "$STATE_DIR/dist" "$STATE_DIR/web"
+
+  log "Building relay-inject.so…"
+  gcc -shared -fPIC -O2 -Wall -o "$STATE_DIR/relay-inject.so" "$REPO_DIR/native/relay-inject.c" -ldl
+
+  log "Installing server dependencies…"
+  (cd "$REPO_DIR/server" && npm install --omit=dev --no-audit --no-fund --loglevel=error >/dev/null)
+
+  save_config
+  log "Installed. Run: copilot-web start"
+}
+
+desktop_app_pids() {
+  # GitHub Copilot desktop processes not started by copilot-web.
+  local ours=""; pid_alive "$RUN_DIR/backend.pid" && ours="$(cat "$RUN_DIR/backend.pid")"
+  pgrep -x github 2>/dev/null | while read -r p; do
+    [ "$p" = "$ours" ] && continue
+    if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^COPILOT_WEB_HEADLESS_UI=1$'; then continue; fi
+    echo "$p"
+  done
+}
+
+start_xvfb() {
+  if pid_alive "$RUN_DIR/xvfb.pid"; then return; fi
+  local n="${COPILOT_WEB_DISPLAY#:}"
+  rm -f "/tmp/.X${n}-lock" "/tmp/.X11-unix/X${n}" 2>/dev/null || true
+  setsid Xvfb "$COPILOT_WEB_DISPLAY" -screen 0 1280x800x24 -nolisten tcp >"$LOG_DIR/xvfb.log" 2>&1 < /dev/null &
+  echo $! > "$RUN_DIR/xvfb.pid"
+  for _ in $(seq 1 20); do [ -e "/tmp/.X11-unix/X${n}" ] && break; sleep 0.25; done
+}
+
+start_session_bus() {
+  # Private session bus + Secret Service (gnome-keyring) for the app's credentials.
+  if [ -f "$RUN_DIR/dbus.env" ]; then
+    # shellcheck disable=SC1091
+    . "$RUN_DIR/dbus.env"
+    if [ -n "${DBUS_SESSION_BUS_PID:-}" ] && kill -0 "$DBUS_SESSION_BUS_PID" 2>/dev/null; then return; fi
+  fi
+  dbus-launch --sh-syntax > "$RUN_DIR/dbus.env"
+  # shellcheck disable=SC1091
+  . "$RUN_DIR/dbus.env"
+  printf '' | DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
+  DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" gnome-keyring-daemon --start --components=secrets >/dev/null 2>&1 || true
+}
+
+web_url() {
+  if [ -n "${CODESPACE_NAME:-}" ]; then
+    echo "https://${CODESPACE_NAME}-${COPILOT_WEB_PORT}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}/"
+  else
+    echo "http://localhost:${COPILOT_WEB_PORT}/"
+  fi
+}
+
+load_codespace_env() {
+  # SSH sessions may lack the Codespaces variables; read them from the container env.
+  if [ -z "${CODESPACE_NAME:-}" ] && [ -r /proc/1/environ ]; then
+    local v
+    v="$(tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^CODESPACE_NAME=//p')" && [ -n "$v" ] && export CODESPACE_NAME="$v"
+    v="$(tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN=//p')" && [ -n "$v" ] && export GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN="$v"
+  fi
+  return 0
+}
+
+cmd_start() {
+  load_config
+  local replace=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) COPILOT_WEB_PORT="$2"; shift 2 ;;
+      --password) COPILOT_WEB_PASSWORD="$2"; shift 2 ;;
+      --replace) replace=1; shift ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [ -x "$APP_DIR/usr/bin/github" ] && [ -f "$STATE_DIR/web/index.html" ] && [ -f "$STATE_DIR/relay-inject.so" ] \
+    || die "Not installed. Run: copilot-web install"
+  [ -d "$REPO_DIR/server/node_modules/ws" ] || (cd "$REPO_DIR/server" && npm install --omit=dev --no-audit --no-fund --loglevel=error >/dev/null)
+  save_config
+  load_codespace_env
+
+  local others; others="$(desktop_app_pids | tr '\n' ' ')"
+  if [ -n "${others// /}" ]; then
+    if [ "$replace" -eq 1 ]; then
+      log "Stopping the running desktop app (pid $others)…"
+      # shellcheck disable=SC2086
+      kill $others 2>/dev/null || true
+      for _ in $(seq 1 30); do [ -z "$(desktop_app_pids)" ] && break; sleep 0.5; done
+      [ -z "$(desktop_app_pids)" ] || die "The desktop app did not exit."
+    else
+      die "The GitHub Copilot desktop app is already running (pid $others). Quit it first or use --replace."
+    fi
+  fi
+
+  local relay_token
+  if pid_alive "$RUN_DIR/backend.pid" && [ -f "$RUN_DIR/relay.token" ]; then
+    relay_token="$(cat "$RUN_DIR/relay.token")"
+  else
+    relay_token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    (umask 077; printf '%s' "$relay_token" > "$RUN_DIR/relay.token")
+  fi
+  (umask 077; sed -e "s/__COPILOT_WEB_PORT__/${COPILOT_WEB_PORT}/" \
+      -e "s/__COPILOT_WEB_RELAY_TOKEN__/'${relay_token}'/" \
+      "$REPO_DIR/native/relay.js" > "$RUN_DIR/relay.js")
+
+  if ! pid_alive "$RUN_DIR/server.pid"; then
+    log "Starting web server on port $COPILOT_WEB_PORT…"
+    COPILOT_WEB_PORT="$COPILOT_WEB_PORT" COPILOT_WEB_PASSWORD="$COPILOT_WEB_PASSWORD" \
+    COPILOT_WEB_RELAY_TOKEN="$relay_token" COPILOT_WEB_STATE="$STATE_DIR" \
+      setsid node "$REPO_DIR/server/server.mjs" >>"$LOG_DIR/server.log" 2>&1 < /dev/null &
+    echo $! > "$RUN_DIR/server.pid"
+  fi
+
+  if ! pid_alive "$RUN_DIR/backend.pid"; then
+    start_xvfb
+    start_session_bus
+    log "Starting Copilot backend (headless)…"
+    (
+      unset WAYLAND_DISPLAY
+      export DISPLAY="$COPILOT_WEB_DISPLAY" GDK_BACKEND=x11
+      export DBUS_SESSION_BUS_ADDRESS
+      export LD_PRELOAD="$STATE_DIR/relay-inject.so${LD_PRELOAD:+ $LD_PRELOAD}"
+      export COPILOT_WEB_RELAY_JS="$RUN_DIR/relay.js" COPILOT_WEB_HEADLESS_UI=1
+      export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+      export APPIMAGE="$STATE_DIR/GitHub-Copilot.AppImage" APPDIR="$APP_DIR"
+      cd "$HOME"
+      exec setsid "$APP_DIR/AppRun" >>"$LOG_DIR/backend.log" 2>&1 < /dev/null
+    ) &
+    echo $! > "$RUN_DIR/backend.pid"
+  fi
+
+  log "Waiting for the backend…"
+  local ok=0
+  for _ in $(seq 1 90); do
+    if curl -fsS "http://127.0.0.1:${COPILOT_WEB_PORT}/__health" 2>/dev/null | grep -q '"relay":true'; then ok=1; break; fi
+    pid_alive "$RUN_DIR/backend.pid" || break
+    sleep 1
+  done
+  if [ "$ok" -ne 1 ]; then
+    tail -n 30 "$LOG_DIR/backend.log" >&2 || true
+    die "Backend did not become ready. See: copilot-web logs backend"
+  fi
+  log "Ready: $(web_url)"
+  if [ -n "${CODESPACE_NAME:-}" ]; then
+    log "Port ${COPILOT_WEB_PORT} is forwarded by Codespaces (keep it Private)."
+  fi
+}
+
+stop_pidfile() {
+  local f="$1" name="$2"
+  if pid_alive "$f"; then
+    local p; p="$(cat "$f")"
+    log "Stopping $name ($p)…"
+    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
+    for _ in $(seq 1 40); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+    kill -0 "$p" 2>/dev/null && { kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null || true; }
+  fi
+  rm -f "$f"
+}
+
+cmd_stop() {
+  load_config
+  stop_pidfile "$RUN_DIR/server.pid" "web server"
+  stop_pidfile "$RUN_DIR/backend.pid" "backend"
+  stop_pidfile "$RUN_DIR/xvfb.pid" "Xvfb"
+  if [ -f "$RUN_DIR/dbus.env" ]; then
+    # shellcheck disable=SC1091
+    . "$RUN_DIR/dbus.env"
+    [ -n "${DBUS_SESSION_BUS_PID:-}" ] && kill "$DBUS_SESSION_BUS_PID" 2>/dev/null || true
+    rm -f "$RUN_DIR/dbus.env"
+  fi
+}
+
+cmd_status() {
+  load_config
+  load_codespace_env
+  local s
+  for s in server backend xvfb; do
+    if pid_alive "$RUN_DIR/$s.pid"; then printf '%-8s running (pid %s)\n' "$s" "$(cat "$RUN_DIR/$s.pid")"; else printf '%-8s stopped\n' "$s"; fi
+  done
+  curl -fsS "http://127.0.0.1:${COPILOT_WEB_PORT}/__health" 2>/dev/null && echo
+  echo "url      $(web_url)"
+}
+
+cmd_logs() {
+  load_config
+  local which="${1:-server}"; shift || true
+  local f="$LOG_DIR/$which.log"
+  [ -f "$f" ] || die "No log: $f"
+  if [ "${1:-}" = "-f" ]; then tail -n 100 -f "$f"; else tail -n 200 "$f"; fi
+}
+
+cmd_autostart() {
+  local rc="$HOME/.bashrc" marker="# copilot-web autostart"
+  case "${1:-}" in
+    enable)
+      grep -q "$marker" "$rc" 2>/dev/null || cat >> "$rc" <<EOF
+$marker
+( "$REPO_DIR/bin/copilot-web" start >/dev/null 2>&1 & ) $marker
+EOF
+      log "Autostart enabled ($rc)." ;;
+    disable)
+      [ -f "$rc" ] && sed -i "/$marker/d" "$rc"
+      log "Autostart disabled." ;;
+    *) die "Usage: copilot-web autostart enable|disable" ;;
+  esac
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop ;;
+  restart) shift; cmd_stop; cmd_start "$@" ;;
+  status) cmd_status ;;
+  logs) shift; cmd_logs "$@" ;;
+  url) load_config; load_codespace_env; web_url ;;
+  autostart) shift; cmd_autostart "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 2 ;;
+esac
