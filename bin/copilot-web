@@ -71,7 +71,7 @@ apt_install() {
   if need apt-get; then
     log "Installing system packages: ${pkgs[*]}"
     local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
-    $SUDO apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "${pkgs[@]}" >/dev/null
+    $SUDO apt-get update -qq >/dev/null && $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1
   else
     die "Missing: ${pkgs[*]}. Install them with your package manager."
   fi
@@ -106,7 +106,7 @@ ensure_runtime_libs() {
   local missing pkgs=() lib
   missing="$(LD_LIBRARY_PATH="$APP_DIR/usr/lib" ldd "$APP_DIR/usr/bin/github" \
     "$APP_DIR"/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/* "$APP_DIR"/usr/lib/aarch64-linux-gnu/webkit2gtk-4.1/* \
-    "$APP_DIR"/usr/lib/libwebkit2gtk*.so* 2>/dev/null | awk '/not found/ {print $1}' | sort -u)"
+    "$APP_DIR"/usr/lib/libwebkit2gtk*.so* 2>/dev/null | awk '/not found/ {print $1}' | sort -u)" || true
   for lib in $missing; do
     case "$lib" in
       libasound.so.2) pkgs+=(libasound2) ;;
@@ -208,7 +208,7 @@ start_xvfb() {
   if pid_alive "$RUN_DIR/xvfb.pid"; then return; fi
   local n="${COPILOT_WEB_DISPLAY#:}"
   rm -f "/tmp/.X${n}-lock" "/tmp/.X11-unix/X${n}" 2>/dev/null || true
-  setsid Xvfb "$COPILOT_WEB_DISPLAY" -screen 0 3840x2160x24 -nolisten tcp >"$LOG_DIR/xvfb.log" 2>&1 < /dev/null &
+  setsid Xvfb "$COPILOT_WEB_DISPLAY" -screen 0 3840x2160x24 -nolisten tcp >"$LOG_DIR/xvfb.log" 2>&1 < /dev/null 9>&- &
   echo $! > "$RUN_DIR/xvfb.pid"
   for _ in $(seq 1 20); do [ -e "/tmp/.X11-unix/X${n}" ] && break; sleep 0.25; done
 }
@@ -220,11 +220,11 @@ start_session_bus() {
     . "$RUN_DIR/dbus.env"
     if [ -n "${DBUS_SESSION_BUS_PID:-}" ] && kill -0 "$DBUS_SESSION_BUS_PID" 2>/dev/null; then return; fi
   fi
-  dbus-launch --sh-syntax > "$RUN_DIR/dbus.env"
+  dbus-launch --sh-syntax > "$RUN_DIR/dbus.env" 9>&-
   # shellcheck disable=SC1091
   . "$RUN_DIR/dbus.env"
-  printf '' | DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
-  DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" gnome-keyring-daemon --start --components=secrets >/dev/null 2>&1 || true
+  printf '' | DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 9>&- || true
+  DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" gnome-keyring-daemon --start --components=secrets >/dev/null 2>&1 9>&- || true
 }
 
 web_url() {
@@ -277,8 +277,10 @@ cmd_start() {
     fi
   fi
 
+  # Serialize concurrent starts (autostart + postStartCommand). Children must not
+  # inherit fd 9, or they would hold the lock for their whole lifetime.
   exec 9>"$RUN_DIR/start.lock"
-  flock 9
+  flock -w 300 9 || die "Another 'copilot-web start' is still running."
 
   local relay_token
   if { pid_alive "$RUN_DIR/backend.pid" || pid_alive "$RUN_DIR/server.pid"; } && [ -f "$RUN_DIR/relay.token" ]; then
@@ -295,7 +297,7 @@ cmd_start() {
     log "Starting web server on port $COPILOT_WEB_PORT…"
     COPILOT_WEB_PORT="$COPILOT_WEB_PORT" COPILOT_WEB_PASSWORD="$COPILOT_WEB_PASSWORD" \
     COPILOT_WEB_RELAY_TOKEN="$relay_token" COPILOT_WEB_STATE="$STATE_DIR" COPILOT_WEB_DISPLAY="$COPILOT_WEB_DISPLAY" \
-      setsid node "$REPO_DIR/server/server.mjs" >>"$LOG_DIR/server.log" 2>&1 < /dev/null &
+      setsid node "$REPO_DIR/server/server.mjs" >>"$LOG_DIR/server.log" 2>&1 < /dev/null 9>&- &
     echo $! > "$RUN_DIR/server.pid"
   fi
 
@@ -313,7 +315,7 @@ cmd_start() {
       export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
       export APPIMAGE="$STATE_DIR/GitHub-Copilot.AppImage" APPDIR="$APP_DIR"
       cd "$HOME"
-      exec setsid "$APP_DIR/AppRun" >>"$LOG_DIR/backend.log" 2>&1 < /dev/null
+      exec setsid "$APP_DIR/AppRun" >>"$LOG_DIR/backend.log" 2>&1 < /dev/null 9>&-
     ) &
     echo $! > "$RUN_DIR/backend.pid"
   fi

@@ -122,9 +122,37 @@
   // ---------------------------------------------------------------------------
   // Commands handled in the browser
   function openUrl(url) {
-    var w = window.open(url, '_blank', 'noopener,noreferrer');
-    if (!w) location.assign(url);
+    var w = null;
+    try { w = window.open(url, '_blank'); } catch (e) { w = null; }
+    if (w) {
+      try { w.opener = null; } catch (e) { /* ignore */ }
+    } else {
+      showLinkBanner(url);
+    }
     return null;
+  }
+  // Popup blocked (no user gesture): offer the link instead of leaving the app.
+  function showLinkBanner(url) {
+    var bar = document.createElement('div');
+    bar.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:2147483600;max-width:80vw;' +
+      'background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:10px 14px;font:13px system-ui;' +
+      'box-shadow:0 8px 24px rgba(0,0,0,.4);display:flex;gap:12px;align-items:center;';
+    var a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = 'Open link: ' + (url.length > 80 ? url.slice(0, 77) + '…' : url);
+    a.style.cssText = 'color:#4493f8;word-break:break-all;';
+    var close = document.createElement('button');
+    close.textContent = '×';
+    close.style.cssText = 'background:none;border:0;color:#9198a1;font-size:18px;cursor:pointer;';
+    function remove() { bar.remove(); }
+    a.addEventListener('click', function () { setTimeout(remove, 0); });
+    close.addEventListener('click', remove);
+    bar.appendChild(a);
+    bar.appendChild(close);
+    document.body.appendChild(bar);
+    setTimeout(remove, 60000);
   }
   function fileUrl(path) { return '/__file?path=' + encodeURIComponent(path); }
 
