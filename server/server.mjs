@@ -26,7 +26,10 @@ const RUN_DIR = process.env.COPILOT_RUN_DIR || path.join(os.homedir(), '.copilot
 const PASSWORD = process.env.COPILOT_WEB_PASSWORD || '';
 const RELAY_TOKEN = process.env.COPILOT_WEB_RELAY_TOKEN || '';
 const UPLOAD_DIR = path.join(STATE_DIR, 'uploads');
-const historyCache = createHistoryCache(path.join(STATE_DIR, 'history-cache'));
+// Large, rebuildable cache: keep it off the persisted disk (Codespaces export
+// the home/workspace disk on shutdown; /tmp is a local scratch disk).
+const historyCache = createHistoryCache(process.env.COPILOT_WEB_CACHE ||
+  path.join(os.tmpdir(), `copilot-web-history-${process.getuid ? process.getuid() : 'user'}`));
 
 if (!RELAY_TOKEN) {
   console.error('COPILOT_WEB_RELAY_TOKEN is required');

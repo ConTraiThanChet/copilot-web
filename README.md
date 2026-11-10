@@ -133,8 +133,9 @@ Requirements: Linux x86_64 or arm64, Node.js 20+. On Debian or Ubuntu,
 ## Limitations
 
 * The first scroll-up in a long session after the web server starts waits
-  until the history cache is built. The cache lives in
-  `~/.local/share/copilot-web/history-cache` and is rebuilt after a restart.
+  until the history cache is built. The cache lives in `/tmp` (on Codespaces a
+  local scratch disk that is not exported on shutdown) and is rebuilt after a
+  restart.
 
 * Native views (browser preview and extension canvases) are streamed as images.
   They update a few times per second when their content changes. Text inside

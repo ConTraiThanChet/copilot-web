@@ -227,6 +227,15 @@ start_session_bus() {
   DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" gnome-keyring-daemon --start --components=secrets >/dev/null 2>&1 9>&- || true
 }
 
+rotate_logs() {
+  # Keep logs small: the host disk may be exported (Codespaces) on shutdown.
+  local f
+  for f in "$LOG_DIR"/*.log; do
+    [ -f "$f" ] || continue
+    if [ "$(stat -c %s "$f")" -gt 2000000 ]; then mv -f "$f" "$f.old"; fi
+  done
+}
+
 web_url() {
   if [ -n "${CODESPACE_NAME:-}" ]; then
     echo "https://${CODESPACE_NAME}-${COPILOT_WEB_PORT}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}/"
@@ -293,6 +302,8 @@ cmd_start() {
       -e "s/__COPILOT_WEB_RELAY_TOKEN__/'${relay_token}'/" \
       "$REPO_DIR/native/relay.js" > "$RUN_DIR/relay.js")
 
+  rotate_logs
+
   if ! pid_alive "$RUN_DIR/server.pid"; then
     log "Starting web server on port $COPILOT_WEB_PORT…"
     COPILOT_WEB_PORT="$COPILOT_WEB_PORT" COPILOT_WEB_PASSWORD="$COPILOT_WEB_PASSWORD" \
@@ -315,6 +326,7 @@ cmd_start() {
       export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
       export APPIMAGE="$STATE_DIR/GitHub-Copilot.AppImage" APPDIR="$APP_DIR"
       cd "$HOME"
+      export ALSA_CONFIG_PATH=/dev/null
       exec setsid "$APP_DIR/AppRun" >>"$LOG_DIR/backend.log" 2>&1 < /dev/null 9>&-
     ) &
     echo $! > "$RUN_DIR/backend.pid"
