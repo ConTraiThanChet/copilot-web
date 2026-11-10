@@ -63,6 +63,13 @@ The first time you open the web UI, sign in the same way as in the desktop app:
 Credentials are stored on the host, in its keyring and `~/.copilot`, and are
 shared with the desktop app if it runs on the same host.
 
+### Other hosts (VPS, Tailscale)
+
+Open `http://<host>:8787/` from your tailnet, or serve it over HTTPS with
+`tailscale serve --bg 8787`. Plain HTTP on a non-localhost address isn't a
+"secure context", so Copilot Web polyfills the browser APIs the app needs
+there. The browser clipboard integration needs HTTPS.
+
 ### Security
 
 Keep the Codespaces port **Private** (the default); GitHub then requires your
