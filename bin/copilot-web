@@ -124,7 +124,7 @@ ensure_runtime_libs() {
   # Software OpenGL for the hidden webview, and fonts for rendered pages.
   [ -e /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so ] || [ -e /usr/lib/aarch64-linux-gnu/dri/swrast_dri.so ] \
     || ls /usr/lib/*/dri/*swrast* >/dev/null 2>&1 || pkgs+=(libgl1-mesa-dri)
-  fc-list 2>/dev/null | grep -q . || pkgs+=(fonts-dejavu-core fontconfig)
+  [ -n "$(fc-list 2>/dev/null | head -n1)" ] || pkgs+=(fonts-dejavu-core fontconfig)
   if [ ${#pkgs[@]} -gt 0 ]; then
     mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
     apt_install "${pkgs[@]}"
