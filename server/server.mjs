@@ -15,7 +15,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
-import { createHistoryCache, bridgeBackend } from './history-proxy.mjs';
+import { createHistoryCache, bridgeBackend, createOpenWorkReader } from './history-proxy.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.COPILOT_WEB_HOST || '0.0.0.0';
@@ -28,6 +28,7 @@ const RELAY_TOKEN = process.env.COPILOT_WEB_RELAY_TOKEN || '';
 const UPLOAD_DIR = path.join(STATE_DIR, 'uploads');
 // Large, rebuildable cache: keep it off the persisted disk (Codespaces export
 // the home/workspace disk on shutdown; /tmp is a local scratch disk).
+const openWork = createOpenWorkReader(path.join(process.env.COPILOT_HOME || path.join(os.homedir(), '.copilot'), 'session-state'));
 const historyCache = createHistoryCache(process.env.COPILOT_WEB_CACHE ||
   path.join(os.tmpdir(), `copilot-web-history-${process.getuid ? process.getuid() : 'user'}`));
 
@@ -541,7 +542,7 @@ async function proxyBackend(req, socket, head, url) {
   if (!be) { socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n'); return; }
   url.searchParams.set('token', be.token);
   const backendUrl = `ws://127.0.0.1:${be.port}/?${url.searchParams.toString()}`;
-  wssBackend.handleUpgrade(req, socket, head, (ws) => bridgeBackend(ws, backendUrl, historyCache, log));
+  wssBackend.handleUpgrade(req, socket, head, (ws) => bridgeBackend(ws, backendUrl, historyCache, log, openWork));
 }
 
 server.on('upgrade', (req, socket, head) => {

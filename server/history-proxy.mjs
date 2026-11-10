@@ -186,8 +186,72 @@ function trimTail(events) {
   return kept.reverse();
 }
 
+// In-progress work read from the session's events.jsonl on this host:
+// running background agents (subagent.started without completed/failed), the
+// task tool calls that launched them, and top-level tool calls without a
+// result. The UI rebuilds its "Background" list from these start events, which
+// for long-running agents lie far before the visible part of the history.
+export function createOpenWorkReader(sessionStateDir) {
+  const state = new Map(); // sessionId -> index
+  async function scan(sessionId) {
+    const file = path.join(sessionStateDir, sessionId, 'events.jsonl');
+    let st;
+    try { st = fs.statSync(file); } catch { return null; }
+    let ix = state.get(sessionId);
+    if (!ix || st.size < ix.offset) {
+      ix = { offset: 0, rest: '', order: 0, agents: new Map(), tools: new Map(), tasks: new Map(), busy: null };
+      state.set(sessionId, ix);
+    }
+    if (ix.busy) return ix.busy;
+    if (st.size === ix.offset) return ix;
+    ix.busy = new Promise((resolve) => {
+      const stream = fs.createReadStream(file, { start: ix.offset, end: st.size - 1, encoding: 'utf8', highWaterMark: 1 << 20 });
+      stream.on('data', (chunk) => {
+        const lines = (ix.rest + chunk).split('\n');
+        ix.rest = lines.pop();
+        for (const line of lines) {
+          ix.order++;
+          if (!line.startsWith('{"type":"subagent.') && !line.startsWith('{"type":"tool.execution_')) continue;
+          let e;
+          try { e = JSON.parse(line); } catch { continue; }
+          const id = e.data && e.data.toolCallId;
+          if (!id) continue;
+          const item = { order: ix.order, event: e };
+          switch (e.type) {
+            case 'subagent.started': ix.agents.set(id, item); break;
+            case 'subagent.completed': case 'subagent.failed': ix.agents.delete(id); ix.tasks.delete(id); break;
+            case 'tool.execution_start':
+              if (!e.agentId) {
+                ix.tools.set(id, item);
+                if (e.data.toolName === 'task') ix.tasks.set(id, item);
+              }
+              break;
+            case 'tool.execution_complete': if (!e.agentId) ix.tools.delete(id); break;
+          }
+        }
+      });
+      const done = () => { ix.offset = st.size; ix.busy = null; resolve(ix); };
+      stream.on('end', done);
+      stream.on('error', () => { ix.busy = null; resolve(ix); });
+    });
+    return ix.busy;
+  }
+  return async function openWork(sessionId) {
+    const ix = await scan(sessionId);
+    if (!ix) return [];
+    const items = new Map();
+    for (const [id, it] of ix.agents) {
+      items.set(it.event.id, it);
+      const t = ix.tasks.get(id);
+      if (t) items.set(t.event.id, t);
+    }
+    for (const it of ix.tools.values()) items.set(it.event.id, it);
+    return [...items.values()].sort((a, b) => a.order - b.order).map((it) => it.event);
+  };
+}
+
 // Connects one browser WebSocket to the backend through the history proxy.
-export function bridgeBackend(browser, backendUrl, cache, log) {
+export function bridgeBackend(browser, backendUrl, cache, log, openWork = null) {
   const backend = new WebSocket(backendUrl, {
     headers: { Origin: 'tauri://localhost' },
     perMessageDeflate: false,
@@ -281,6 +345,16 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
       return handleHistory(inner);
     }
     if (m.type === 'session_history_chunk' || m.type === 'session_history') return handleHistory(m);
+    if (m.type === 'session_history_deferred' && m.request_id) {
+      const st = deferredResumes.get(m.request_id);
+      if (st && st.capturing && !st.capturing.complete) {
+        // No complete history will follow after all.
+        st.capturing.fail();
+        st.capturing = null;
+        flushTail(m.request_id, st, null);
+        return;
+      }
+    }
     if (m.request_id && finishedRequests.has(m.request_id)) {
       if (process.env.COPILOT_WEB_DEBUG) log('dropped', text.slice(0, 200));
       return; // stray progress/errors after deferral
@@ -306,7 +380,12 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
     const req = msg && msg.request_id;
     const state = req ? deferredResumes.get(req) : undefined;
     if (req && finishedRequests.has(req) && !state) return;
-    if (!state) return sendBrowser(JSON.stringify(m));
+    if (!state) {
+      if (msg && msg.prepend && sentEarly.size && Array.isArray(msg.events)) {
+        msg.events = msg.events.filter((e) => !sentEarly.has(e.id));
+      }
+      return sendBrowser(JSON.stringify(m));
+    }
 
     if (msg.streaming_older === true && !state.tailDone) {
       // Tail of the history: buffer it (it arrives quickly from the local
@@ -318,11 +397,21 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
         delete state.tailMeta.events;
       }
       for (const e of events) state.tailEvents.push(e);
+      if (typeof msg.older_cursor === 'string') state.nativeCursor = msg.older_cursor;
       if (m.type !== 'session_history' && m.last !== true) return;
       const trimmed = trimTail(state.tailEvents);
       state.tailEvents = null;
       state.tailDone = true;
+      finishedRequests.add(req);
       state.pendingTail = { ...state.tailMeta, type: 'session_history', events: trimmed };
+      delete state.pendingTail.older_cursor;
+      if (state.nativeCursor) {
+        // The backend pages older history itself (it sends
+        // session_history_deferred next): keep its cursor, capture nothing.
+        state.native = true;
+        flushTail(req, state, null);
+        return;
+      }
       const firstId = trimmed.length && typeof trimmed[0].id === 'string' ? trimmed[0].id : null;
       const existing = cache.get(state.sessionId);
       if (!firstId) {
@@ -359,35 +448,41 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
     }
   }
 
-  function flushTail(req, state, c) {
+  async function flushTail(req, state, c) {
     if (!state.pendingTail) return;
     clearTimeout(state.tailTimer);
     const out = state.pendingTail;
     state.pendingTail = null;
+    finishedRequests.add(req);
     const firstId = out.events.length ? out.events[0].id : null;
-    if (firstId) {
+    let lead = [];
+    if (state.native) {
+      out.older_cursor = state.nativeCursor;
+    } else if (firstId) {
       out.older_cursor = CURSOR_PREFIX + firstId;
       const page = c && !c.failed && c.has(firstId) ? c.page(firstId) : null;
-      let lead = [];
       if (page && page.count > 0) {
         lead = JSON.parse(`[${page.events}]`);
         if (page.olderCursorId) out.older_cursor = CURSOR_PREFIX + page.olderCursorId;
         else delete out.older_cursor;
       }
-      if (c && !c.failed && c.has(firstId)) {
-        const start = lead.length ? c.indexOf(lead[0].id) : c.indexOf(firstId);
+    }
+    if (openWork) {
+      try {
         const have = new Set(lead.map((e) => e.id).concat(out.events.map((e) => e.id)));
-        const open = c.openEvents(start).filter((e) => !have.has(e.id));
+        const open = (await openWork(state.sessionId)).filter((e) => !have.has(e.id));
         for (const e of open) sentEarly.add(e.id);
         lead = open.concat(lead);
+      } catch (e) {
+        log('open work scan failed:', e.message);
       }
-      out.events = lead.concat(out.events);
     }
-    finishedRequests.add(req);
+    out.events = lead.concat(out.events);
     sendBrowser(JSON.stringify(out));
     sendBrowser(JSON.stringify({ type: 'session_history_deferred', session_id: state.sessionId, request_id: req }));
     if (!state.capturing) deferredResumes.delete(req);
   }
+
 
   // ---- lifecycle ---------------------------------------------------------
   const close = () => {
