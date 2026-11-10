@@ -64,7 +64,23 @@ EOF
 
 need() { command -v "$1" >/dev/null 2>&1; }
 
-pid_alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+# A pid file only counts if its process is still the one we started: after a
+# crash (e.g. a proot crash on hosts without root) pids get reused, and stop
+# would otherwise signal an unrelated process group.
+pid_alive() {
+  [ -f "$1" ] || return 1
+  local p want cmd
+  p="$(cat "$1" 2>/dev/null)"
+  [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null || return 1
+  case "$(basename "$1")" in
+    server.pid) want="server.mjs" ;;
+    backend.pid) want="github|AppRun" ;;
+    xvfb.pid) want="Xvfb" ;;
+    *) return 0 ;;
+  esac
+  cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+  [[ "$cmd" =~ $want ]]
+}
 
 apt_install() {
   local pkgs=("$@")
