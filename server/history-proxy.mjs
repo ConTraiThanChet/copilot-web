@@ -122,6 +122,32 @@ export function createHistoryCache(dir) {
   return { get, begin, releaseOwner };
 }
 
+const TAIL_MAX_BYTES = 3 * 1024 * 1024;
+const TAIL_DETAIL_BYTES = 768 * 1024;
+const TAIL_WAIT_MS = 45000;
+
+// The backend's recent tail can be tens of MB in busy sessions (subagent tool
+// output, screenshots). Keep the newest events within a byte budget: every
+// event in the last TAIL_DETAIL_BYTES, then only main-conversation and
+// subagent lifecycle events. Older events are served from the cache.
+function trimTail(events) {
+  const kept = [];
+  let bytes = 0, all = 0;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    const len = JSON.stringify(e).length;
+    all += len;
+    if (all > TAIL_DETAIL_BYTES && !isPagedEvent(e)) continue;
+    if (kept.length && bytes + len > TAIL_MAX_BYTES) {
+      if (isPagedEvent(e)) break;
+      continue; // skip an oversized subagent event rather than stopping
+    }
+    kept.push(e);
+    bytes += len;
+  }
+  return kept.reverse();
+}
+
 // Connects one browser WebSocket to the backend through the history proxy.
 export function bridgeBackend(browser, backendUrl, cache, log) {
   const backend = new WebSocket(backendUrl, {
@@ -240,39 +266,35 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
     if (!state) return sendBrowser(JSON.stringify(m));
 
     if (msg.streaming_older === true && !state.tailDone) {
-      // Tail of the history: forward, with a cursor for older pages.
+      // Tail of the history: buffer it (it arrives quickly from the local
+      // backend), then send the browser a trimmed tail with a cursor.
       const events = Array.isArray(msg.events) ? msg.events : [];
-      if (!state.firstEventId && events.length && typeof events[0].id === 'string') {
-        state.firstEventId = events[0].id;
-        msg.older_cursor = CURSOR_PREFIX + state.firstEventId;
-        // The backend's tail is mostly subagent events in busy sessions. When a
-        // cache covers it, lead with a page of the main conversation as well.
-        const c = cache.get(state.sessionId);
-        const extra = c && !c.failed && c.has(state.firstEventId) ? c.page(state.firstEventId) : null;
-        if (extra && extra.count > 0) {
-          msg.events = JSON.parse(`[${extra.events}]`).concat(events);
-          if (extra.olderCursorId) msg.older_cursor = CURSOR_PREFIX + extra.olderCursorId;
-          else delete msg.older_cursor;
-        }
+      if (!state.tailEvents) {
+        state.tailEvents = [];
+        state.tailMeta = { ...msg };
+        delete state.tailMeta.events;
       }
-      sendBrowser(JSON.stringify(m));
-      if (m.type === 'session_history' || m.last === true) {
-        state.tailDone = true;
-        finishedRequests.add(req);
-        sendBrowser(JSON.stringify({ type: 'session_history_deferred', session_id: state.sessionId, request_id: req }));
-        const existing = cache.get(state.sessionId);
-        if (!state.firstEventId) {
-          // Nothing older than an empty tail.
-          sendBackend(JSON.stringify({ type: 'cancel_session_history', session_id: state.sessionId, request_id: req }));
-          deferredResumes.delete(req);
-        } else if (existing && !existing.failed && (existing.has(state.firstEventId) || (existing.owner && !existing.complete))) {
-          // A cache already covers (or is building) this history.
-          sendBackend(JSON.stringify({ type: 'cancel_session_history', session_id: state.sessionId, request_id: req }));
-          deferredResumes.delete(req);
-        } else {
-          state.capturing = cache.begin(state.sessionId, owner);
-          log(`capturing history for session ${state.sessionId}`);
-        }
+      for (const e of events) state.tailEvents.push(e);
+      if (m.type !== 'session_history' && m.last !== true) return;
+      const trimmed = trimTail(state.tailEvents);
+      state.tailEvents = null;
+      state.tailDone = true;
+      state.pendingTail = { ...state.tailMeta, type: 'session_history', events: trimmed };
+      const firstId = trimmed.length && typeof trimmed[0].id === 'string' ? trimmed[0].id : null;
+      const existing = cache.get(state.sessionId);
+      if (!firstId) {
+        sendBackend(JSON.stringify({ type: 'cancel_session_history', session_id: state.sessionId, request_id: req }));
+        flushTail(req, state, null);
+      } else if (existing && !existing.failed && existing.complete && existing.has(firstId)) {
+        sendBackend(JSON.stringify({ type: 'cancel_session_history', session_id: state.sessionId, request_id: req }));
+        flushTail(req, state, existing);
+      } else {
+        // The backend's tail is often all subagent work. Capture the complete
+        // history (fast, local) so the first view can include a page of the
+        // main conversation; send the tail when it is ready or after a cap.
+        state.capturing = cache.begin(state.sessionId, owner);
+        log(`capturing history for session ${state.sessionId}`);
+        state.tailTimer = setTimeout(() => flushTail(req, state, state.capturing), TAIL_WAIT_MS);
       }
       return;
     }
@@ -281,12 +303,38 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
     if (state.capturing && !state.capturing.failed) {
       const events = Array.isArray(msg.events) ? msg.events : [];
       state.capturing.append(events);
+      if (state.pendingTail && state.capturing.has(state.pendingTail.events[0].id)) {
+        // The page before the tail is captured once the tail start is reached.
+        flushTail(req, state, state.capturing);
+      }
       if (m.type === 'session_history' || m.last === true) {
         state.capturing.finish();
+        flushTail(req, state, state.capturing);
         log(`history cache ready for session ${state.sessionId} (${state.capturing.offsets.length} events)`);
         deferredResumes.delete(req);
       }
     }
+  }
+
+  function flushTail(req, state, c) {
+    if (!state.pendingTail) return;
+    clearTimeout(state.tailTimer);
+    const out = state.pendingTail;
+    state.pendingTail = null;
+    const firstId = out.events.length ? out.events[0].id : null;
+    if (firstId) {
+      out.older_cursor = CURSOR_PREFIX + firstId;
+      const page = c && !c.failed && c.has(firstId) ? c.page(firstId) : null;
+      if (page && page.count > 0) {
+        out.events = JSON.parse(`[${page.events}]`).concat(out.events);
+        if (page.olderCursorId) out.older_cursor = CURSOR_PREFIX + page.olderCursorId;
+        else delete out.older_cursor;
+      }
+    }
+    finishedRequests.add(req);
+    sendBrowser(JSON.stringify(out));
+    sendBrowser(JSON.stringify({ type: 'session_history_deferred', session_id: state.sessionId, request_id: req }));
+    if (!state.capturing) deferredResumes.delete(req);
   }
 
   // ---- lifecycle ---------------------------------------------------------
