@@ -58,12 +58,50 @@ export function createHistoryCache(dir) {
       complete: false,
       failed: false,
       waiters: new Set(),
+      // Work still in progress, keyed by toolCallId -> event index: running
+      // background agents (subagent.started without completion) and top-level
+      // tool calls without a result. The UI needs their start events to show
+      // them (e.g. the "Background" activity list), even when they started
+      // long before the visible part of the history.
+      openAgents: new Map(),
+      openTools: new Map(),
+      track(e, index) {
+        const id = e && e.data && e.data.toolCallId;
+        if (!id) return;
+        switch (e.type) {
+          case 'subagent.started': this.openAgents.set(id, index); break;
+          case 'subagent.completed': case 'subagent.failed': this.openAgents.delete(id); break;
+          case 'tool.execution_start':
+            if (!e.agentId) this.openTools.set(id, index);
+            (this.taskStarts ||= new Map()).set(id, index);
+            break;
+          case 'tool.execution_complete': if (!e.agentId) this.openTools.delete(id); break;
+        }
+      },
+      // Start events of in-progress work that occur before `beforeIndex`.
+      openEvents(beforeIndex) {
+        const idx = new Set();
+        for (const m of [this.openAgents, this.openTools]) for (const i of m.values()) if (i < beforeIndex) idx.add(i);
+        if (this.taskStarts) for (const id of this.openAgents.keys()) {
+          const i = this.taskStarts.get(id);
+          if (i !== undefined && i < beforeIndex) idx.add(i);
+        }
+        // Include the task tool call that launched each open agent.
+        return [...idx].sort((a, b) => a - b).map((i) => {
+          const [off, len] = this.offsets[i];
+          const b = Buffer.alloc(len);
+          fs.readSync(this.fd, b, 0, len, off);
+          return JSON.parse(b.toString('utf8'));
+        });
+      },
+      indexOf(id) { return this.ids.get(id); },
       append(events) {
         const buf = [];
         for (const e of events) {
           const line = Buffer.from(JSON.stringify(e) + '\n');
           this.offsets.push([this.size, line.length - 1, isPagedEvent(e)]);
           if (e && typeof e.id === 'string') this.ids.set(e.id, this.offsets.length - 1);
+          this.track(e, this.offsets.length - 1);
           this.size += line.length;
           buf.push(line);
         }
@@ -159,6 +197,7 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
   const pendingToBackend = [];
   const deferredResumes = new Map(); // request_id -> { sessionId, firstEventId, tailDone, capturing }
   const finishedRequests = new Set(); // request ids whose remaining traffic is ours
+  const sentEarly = new Set(); // ids of older events already sent ahead of their page
   let parts = [];
 
   const sendBrowser = (data) => { if (browser.readyState === 1) browser.send(data); };
@@ -207,8 +246,12 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
     }
     const head = { type: 'session_history', session_id: m.session_id, request_id: m.request_id, prepend: true };
     if (page.olderCursorId) head.older_cursor = CURSOR_PREFIX + page.olderCursorId;
+    let events = page.events;
+    if (sentEarly.size && events) {
+      events = JSON.parse(`[${events}]`).filter((e) => !sentEarly.has(e.id)).map((e) => JSON.stringify(e)).join(',');
+    }
     const json = JSON.stringify(head);
-    sendBrowser(`${json.slice(0, -1)},"events":[${page.events}]}`);
+    sendBrowser(`${json.slice(0, -1)},"events":[${events}]}`);
   }
 
   // ---- backend -> browser ------------------------------------------------
@@ -325,11 +368,20 @@ export function bridgeBackend(browser, backendUrl, cache, log) {
     if (firstId) {
       out.older_cursor = CURSOR_PREFIX + firstId;
       const page = c && !c.failed && c.has(firstId) ? c.page(firstId) : null;
+      let lead = [];
       if (page && page.count > 0) {
-        out.events = JSON.parse(`[${page.events}]`).concat(out.events);
+        lead = JSON.parse(`[${page.events}]`);
         if (page.olderCursorId) out.older_cursor = CURSOR_PREFIX + page.olderCursorId;
         else delete out.older_cursor;
       }
+      if (c && !c.failed && c.has(firstId)) {
+        const start = lead.length ? c.indexOf(lead[0].id) : c.indexOf(firstId);
+        const have = new Set(lead.map((e) => e.id).concat(out.events.map((e) => e.id)));
+        const open = c.openEvents(start).filter((e) => !have.has(e.id));
+        for (const e of open) sentEarly.add(e.id);
+        lead = open.concat(lead);
+      }
+      out.events = lead.concat(out.events);
     }
     finishedRequests.add(req);
     sendBrowser(JSON.stringify(out));
