@@ -139,6 +139,11 @@ Requirements: Linux x86_64 or arm64, Node.js 20+. On Debian or Ubuntu,
 
 ## Limitations
 
+* In Autopilot, the Copilot runtime stops waiting for background agents after
+  `COPILOT_TASK_WAIT_TIMEOUT_SECONDS` (runtime default 10 minutes); results that
+  arrive later are not reported to the main agent. Copilot Web starts the
+  backend with 24 hours; set the variable before `copilot-web start` to change it.
+
 * The first scroll-up in a long session after the web server starts waits
   until the history cache is built. The cache lives in `/tmp` (on Codespaces a
   local scratch disk that is not exported on shutdown) and is rebuilt after a

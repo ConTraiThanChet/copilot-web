@@ -339,6 +339,10 @@ cmd_start() {
       export DBUS_SESSION_BUS_ADDRESS
       export LD_PRELOAD="$STATE_DIR/relay-inject.so${LD_PRELOAD:+ $LD_PRELOAD}"
       export COPILOT_WEB_RELAY_JS="$RUN_DIR/relay.js" COPILOT_WEB_HEADLESS_UI=1
+      # Autopilot stops waiting for background agents after this many seconds
+      # (runtime default 600); results that arrive later never reach the main
+      # agent. Long-running remote sessions need a much longer wait.
+      export COPILOT_TASK_WAIT_TIMEOUT_SECONDS="${COPILOT_TASK_WAIT_TIMEOUT_SECONDS:-86400}"
       export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
       export APPIMAGE="$STATE_DIR/GitHub-Copilot.AppImage" APPDIR="$APP_DIR"
       cd "$HOME"
