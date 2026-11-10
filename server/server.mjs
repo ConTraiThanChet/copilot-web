@@ -8,7 +8,6 @@
 //   /__file     local files and app custom-protocol resources
 //   /__upload   file picker uploads
 import http from 'node:http';
-import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -16,6 +15,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { createHistoryCache, bridgeBackend } from './history-proxy.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.COPILOT_WEB_HOST || '0.0.0.0';
@@ -26,6 +26,7 @@ const RUN_DIR = process.env.COPILOT_RUN_DIR || path.join(os.homedir(), '.copilot
 const PASSWORD = process.env.COPILOT_WEB_PASSWORD || '';
 const RELAY_TOKEN = process.env.COPILOT_WEB_RELAY_TOKEN || '';
 const UPLOAD_DIR = path.join(STATE_DIR, 'uploads');
+const historyCache = createHistoryCache(path.join(STATE_DIR, 'history-cache'));
 
 if (!RELAY_TOKEN) {
   console.error('COPILOT_WEB_RELAY_TOKEN is required');
@@ -526,28 +527,18 @@ function isLoopback(req) {
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
 }
 
+const wssBackend = new WebSocketServer({
+  noServer: true,
+  maxPayload: 512 * 1024 * 1024,
+  perMessageDeflate: { threshold: 1024, zlibDeflateOptions: { level: 6 } },
+});
+
 async function proxyBackend(req, socket, head, url) {
   const be = await backendEndpoint();
   if (!be) { socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n'); return; }
   url.searchParams.set('token', be.token);
-  const upstream = net.connect(be.port, '127.0.0.1', () => {
-    const skip = new Set(['host', 'origin', 'cookie', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-forwarded-port', 'forwarded']);
-    let head0 = `GET /?${url.searchParams.toString()} HTTP/1.1\r\nHost: 127.0.0.1:${be.port}\r\n`;
-    for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      if (!skip.has(req.rawHeaders[i].toLowerCase())) head0 += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
-    }
-    upstream.write(head0 + '\r\n');
-    if (head?.length) upstream.write(head);
-    upstream.pipe(socket);
-    socket.pipe(upstream);
-  });
-  upstream.setNoDelay(true);
-  socket.setNoDelay(true);
-  const close = () => { upstream.destroy(); socket.destroy(); };
-  upstream.on('error', close);
-  socket.on('error', close);
-  upstream.on('close', close);
-  socket.on('close', close);
+  const backendUrl = `ws://127.0.0.1:${be.port}/?${url.searchParams.toString()}`;
+  wssBackend.handleUpgrade(req, socket, head, (ws) => bridgeBackend(ws, backendUrl, historyCache, log));
 }
 
 server.on('upgrade', (req, socket, head) => {

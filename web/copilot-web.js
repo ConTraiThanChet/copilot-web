@@ -268,6 +268,9 @@
     'download_update': function () { return null; },
     'reveal_main_window': function () { window.focus(); return null; },
     'reveal_current_window': function () { window.focus(); return null; },
+    'bootstrap_app_state': function (a, options) {
+      return remoteInvoke('bootstrap_app_state', a, options).then(pruneStaleQueuedRecovery);
+    },
     'read_clipboard_image_attachment': function (a) {
       return readBrowserClipboardImage().then(function (blob) {
         if (!blob) return null;
@@ -277,6 +280,58 @@
       });
     },
   };
+
+  // The app keeps "queued restart recovery" records for messages sent while the
+  // backend restarts, and loads the *complete* session history while any record
+  // exists. A record that is never cleared therefore makes every resume load the
+  // whole (possibly multi-GB) history. Drop records older than this.
+  var QUEUED_RECOVERY_MAX_AGE_MS = 30 * 60 * 1000;
+  var QUEUED_RECOVERY = /^session-queued-restart-recovery(-durable)?:([^:]+)(:.*)?$/;
+  function staleRecovery(value) {
+    try {
+      var rec = typeof value === 'string' ? JSON.parse(value) : value;
+      var msgs = rec && rec.messages;
+      if (!Array.isArray(msgs) || !msgs.length) return true;
+      var now = Date.now();
+      return msgs.every(function (m) {
+        var t = Date.parse(m && m.createdAt);
+        return !isFinite(t) || now - t > QUEUED_RECOVERY_MAX_AGE_MS;
+      });
+    } catch (e) {
+      return false;
+    }
+  }
+  function pruneStaleQueuedRecovery(result) {
+    var values = result && result.values;
+    if (!values || typeof values !== 'object') return result;
+    var pruned = {};
+    Object.keys(values).forEach(function (key) {
+      var m = QUEUED_RECOVERY.exec(key);
+      if (!m || !staleRecovery(values[key])) return;
+      pruned[m[2]] = true;
+      delete values[key];
+      remoteInvoke('set_app_state_value', { key: key, value: null }).catch(function () {});
+    });
+    Object.keys(pruned).forEach(function (sessionId) {
+      var stillQueued = Object.keys(values).some(function (k) {
+        var m = QUEUED_RECOVERY.exec(k);
+        return m && m[2] === sessionId;
+      });
+      var windowsKey = 'session-queued-restart-recovery-windows:' + sessionId;
+      if (!stillQueued && windowsKey in values) {
+        delete values[windowsKey];
+        remoteInvoke('set_app_state_value', { key: windowsKey, value: null }).catch(function () {});
+      }
+      console.info('[copilot-web] dropped stale queued-message recovery for session', sessionId);
+    });
+    try {
+      for (var i = localStorage.length - 1; i >= 0; i--) {
+        var k = localStorage.key(i);
+        if (QUEUED_RECOVERY.test(k) && staleRecovery(localStorage.getItem(k))) localStorage.removeItem(k);
+      }
+    } catch (e) { /* storage unavailable */ }
+    return result;
+  }
 
   function invoke(cmd, args, options) {
     args = args || {};

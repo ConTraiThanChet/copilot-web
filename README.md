@@ -94,6 +94,14 @@ authentication.
   * it loads the empty `/blank.html` instead of the app UI.
 
   The webview only hosts the IPC relay, which keeps memory use low.
+* **Lazy session history:** for long sessions the backend would otherwise
+  stream the complete history (it can be gigabytes) through the tunnel.
+  `server/history-proxy.mjs` sends the browser only the recent tail, captures
+  the full history into a local cache, and serves older pages of the main
+  conversation as you scroll up. Use **Load complete history** in the app to
+  get every subagent detail. The proxy also acknowledges history frames
+  locally and compresses traffic to the browser. Stale "queued message
+  recovery" records, which force a full history load, are dropped at startup.
 * **Native views:** the agent browser preview and extension canvases are native
   webviews on the host. The server captures them with the app's own
   screenshot command, sending a frame only when the content changes. The
@@ -123,6 +131,10 @@ Requirements: Linux x86_64 or arm64, Node.js 20+. On Debian or Ubuntu,
 `install` adds Xvfb, xdotool, dbus-x11, gnome-keyring, and gcc with apt.
 
 ## Limitations
+
+* The first scroll-up in a long session after the web server starts waits
+  until the history cache is built. The cache lives in
+  `~/.local/share/copilot-web/history-cache` and is rebuilt after a restart.
 
 * Native views (browser preview and extension canvases) are streamed as images.
   They update a few times per second when their content changes. Text inside
