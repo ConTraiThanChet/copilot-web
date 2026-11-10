@@ -289,7 +289,10 @@ export function bridgeBackend(browser, backendUrl, cache, log, openWork = null) 
         });
         return;
       }
-    } else if (text.startsWith('{"type":"resume_session"') && text.includes('"defer_older_history":true')) {
+    } else if (process.env.COPILOT_WEB_DEBUG && text.startsWith('{"type":"resume_session"')) {
+      log('resume', text.replace(/"enabled_experiments":\[[^\]]*\],?/, '').slice(0, 220));
+    }
+    if (text.startsWith('{"type":"resume_session"') && text.includes('"defer_older_history":true')) {
       try {
         const m = JSON.parse(text);
         if (m.request_id && m.session_id) deferredResumes.set(m.request_id, { sessionId: m.session_id, firstEventId: null, tailDone: false, capturing: null });
@@ -478,6 +481,7 @@ export function bridgeBackend(browser, backendUrl, cache, log, openWork = null) 
       }
     }
     out.events = lead.concat(out.events);
+    if (process.env.COPILOT_WEB_DEBUG) log(`tail ${state.sessionId} events=${out.events.length} lead=${lead.length} native=${!!state.native}`);
     sendBrowser(JSON.stringify(out));
     sendBrowser(JSON.stringify({ type: 'session_history_deferred', session_id: state.sessionId, request_id: req }));
     if (!state.capturing) deferredResumes.delete(req);

@@ -256,15 +256,52 @@ async function handleUpload(req, res, url) {
   out.on('error', (e) => { res.writeHead(500); res.end(String(e.message)); });
 }
 
+let patchedAssets = null;
+function isPatchedAsset(rel) {
+  if (!patchedAssets) {
+    try { patchedAssets = new Set(JSON.parse(fs.readFileSync(path.join(DIST, '.patched.json'), 'utf8'))); }
+    catch { patchedAssets = new Set(); }
+  }
+  return patchedAssets.has(rel);
+}
+
+// Assets are served under /a/<build>/ so a rebuild (new app version or new
+// Copilot Web patches, which keep the hashed file names) is never mixed with
+// copies the browser cached as immutable.
+let buildId = null;
+function currentBuild() {
+  if (!buildId) {
+    const parts = ['index.html', '.patched.json'].map((f) => {
+      try { return String(fs.statSync(path.join(DIST, f)).mtimeMs); } catch { return '0'; }
+    });
+    buildId = crypto.createHash('sha1').update(parts.join(':')).digest('hex').slice(0, 10);
+  }
+  return buildId;
+}
+function sendIndex(req, res) {
+  fs.readFile(path.join(DIST, 'index.html'), 'utf8', (err, html) => {
+    if (err) { res.writeHead(500); return res.end(); }
+    const body = Buffer.from(html.replace(/([",])\/assets\//g, `$1/a/${currentBuild()}/`));
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'Content-Length': body.length });
+    res.end(req.method === 'HEAD' ? undefined : body);
+  });
+}
+
 function serveStatic(req, res, url) {
   let rel;
   try { rel = decodeURIComponent(url.pathname); } catch { res.writeHead(400); return res.end(); }
-  if (rel === '/') rel = '/index.html';
+  const versioned = /^\/a\/[0-9a-f]+(\/.*)$/.exec(rel);
+  if (versioned) {
+    const file = path.resolve(DIST, './assets' + versioned[1]);
+    if (!file.startsWith(DIST + path.sep)) { res.writeHead(403); return res.end(); }
+    return sendFile(req, res, file, { immutable: true });
+  }
+  if (rel === '/' || rel === '/index.html') return sendIndex(req, res);
   const file = path.resolve(DIST, '.' + rel);
   if (!file.startsWith(DIST + path.sep)) { res.writeHead(403); return res.end(); }
   fs.stat(file, (err, st) => {
-    if (!err && st.isFile()) return sendFile(req, res, file, { immutable: rel.startsWith('/assets/') });
-    if (!path.extname(rel) || rel.endsWith('.html')) return sendFile(req, res, path.join(DIST, 'index.html'));
+    if (!err && st.isFile()) return sendFile(req, res, file, { immutable: rel.startsWith('/assets/') && !isPatchedAsset(rel) });
+    if (!path.extname(rel)) return sendIndex(req, res);
     res.writeHead(404); res.end('Not found');
   });
 }
